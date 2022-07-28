@@ -24,6 +24,8 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 volatile int cbrk;
+int numthreads;
+int edge;
 
 char response[] =
 	"HTTP/1.1 200 OK\r\n"
@@ -152,6 +154,8 @@ io(int svfd)
 						.events = EPOLLIN,
 						.data.fd = fd,
 					};
+					if (edge)
+						e.events |= EPOLLET;
 					if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &e))
 						err(1, "epoll_ctl EPOLL_CTL_ADD");
 				}
@@ -174,54 +178,26 @@ startio(void *arg)
 	return 0;
 }
 
-void
-serve(int numthreads, int svfd)
-{
-	thrd_t *t;
-	int i;
-
-	signal(SIGINT, handlecbrk);
-
-	i = 1; // inherited by accepted sockets
-	if (setsockopt(svfd, IPPROTO_TCP, TCP_NODELAY, &i, sizeof(i)))
-		err(1, "setsockopt TCP_NODELAY");
-
-	i = 10; // seconds
-	if (setsockopt(svfd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &i, sizeof(i)))
-		err(1, "setsockopt TCP_DEFER_ACCEPT");
-
-	if (numthreads > 1)
-	{
-		t = malloc(numthreads * sizeof(*t));
-		if (t == 0)
-			err(1, "malloc");
-		for (i = 1; i < numthreads; i++)
-		{
-			if (thrd_create(t+i, startio, &svfd))
-				errx(1, "thrd_create error");
-		}
-	}
-
-	io(svfd);
-}
-
 int
 main(int argc, char **argv)
 {
 	struct sockaddr_in sin;
-	int numthreads;
 	int svfd;
 	int opt;
 	int on;
+	int i;
+	thrd_t *t;
 
-	numthreads = 0;
 	for (;;)
 	{
-		opt = getopt(argc, argv, "t:");
+		opt = getopt(argc, argv, "et:");
 		if (opt == -1)
 			break;
 		switch (opt)
 		{
+			case 'e':
+				edge = 1; // edge-triggered i/o
+				break;
 			case 't':
 				numthreads = atoi(optarg);
 				break;
@@ -249,7 +225,27 @@ main(int argc, char **argv)
 	if (listen(svfd, 128))
 		err(1, "listen");
 
-	serve(numthreads, svfd);
+	signal(SIGINT, handlecbrk);
+
+	i = 1; // inherited by accepted sockets
+	if (setsockopt(svfd, IPPROTO_TCP, TCP_NODELAY, &i, sizeof(i)))
+		err(1, "setsockopt TCP_NODELAY");
+
+	i = 10; // seconds
+	if (setsockopt(svfd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &i, sizeof(i)))
+		err(1, "setsockopt TCP_DEFER_ACCEPT");
+
+	if (numthreads > 1)
+	{
+		t = malloc(numthreads * sizeof(*t));
+		if (t == 0)
+			err(1, "malloc");
+		for (i = 1; i < numthreads; i++)
+			if (thrd_create(t+i, startio, &svfd))
+				errx(1, "thrd_create error");
+	}
+
+	io(svfd);
 
 	return 0;
 }
