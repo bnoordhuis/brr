@@ -22,24 +22,6 @@
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
-typedef unsigned int uint;
-
-#define count(name)				\
-	do					\
-	{					\
-		static struct counter counter;	\
-		docount(&counter, name);	\
-	}					\
-	while (0)
-
-struct counter
-{
-	u64 n;
-	char *name;
-	struct counter *next;
-};
-
-struct counter *counters;
 
 volatile int cbrk;
 
@@ -48,58 +30,6 @@ char response[] =
 	"Content-Length: 2\r\n"
 	"\r\n"
 	"OK";
-
-void
-docount(struct counter *c, char *name)
-{
-	atomic_uintptr_t *head;
-	atomic_uintptr_t next;
-	uint n;
-
-	n = atomic_fetch_add_explicit((_Atomic u64 *) &c->n, 1, memory_order_relaxed);
-	if (prob(.999, n > 0))
-		return;
-
-	// TODO Weaken memory_order_seq_cst. However, this is the uncommon path
-	// and therefore probably not worth optimizing
-	head = (atomic_uintptr_t *) &counters;
-	for (;;)
-	{
-		next = atomic_load_explicit(head, memory_order_seq_cst);
-
-		atomic_store_explicit(
-			(atomic_uintptr_t *) &c->name, (uintptr_t) name,
-			memory_order_seq_cst);
-
-		atomic_store_explicit(
-			(atomic_uintptr_t *) &c->next, next,
-			memory_order_seq_cst);
-
-		if (atomic_compare_exchange_weak_explicit(
-				head, &next, (atomic_uintptr_t) c,
-				memory_order_seq_cst, memory_order_seq_cst))
-		{
-			return;
-		}
-	}
-}
-
-void
-printcounters(void)
-{
-	atomic_uintptr_t *p;
-	struct counter *c;
-
-	p = (atomic_uintptr_t *) &counters;
-	for (;;)
-	{
-		c = (struct counter *) atomic_load_explicit(p, memory_order_seq_cst);
-		if (!c)
-			return;
-		p = (atomic_uintptr_t *) &c->next;
-		printf("%lu %s\n", c->n, c->name);
-	}
-}
 
 void
 handlecbrk(int nr)
@@ -122,24 +52,7 @@ readrequest(int fd)
 	// peer already went away. A peer that sends fewer bytes than is
 	// reasonable is treated with prejudice.
 	if (prob(.001, n <= (int) sizeof("GET / HTTP/1.0\r\n")-1))
-	{
-		if (n < 0)
-		{
-			if (errno == EAGAIN)
-				count("EAGAIN");
-			else if (errno == ECONNRESET)
-				count("ECONNRESET");
-			else
-				count("read error");
-		}
-		if (n == 0)
-			count("read eof");
-		if (n > 0)
-			count("short read");
 		return 0;
-	}
-
-	count("incoming request");
 
 	__builtin_memcpy(&v, b, 8);
 
@@ -152,10 +65,6 @@ readrequest(int fd)
 		{
 			// Common case: GET request with complete headers.
 			n = write(fd, response, sizeof(response)-1);
-			if (n == -1)
-				count("write error");
-			else if (n != (int) sizeof(response)-1)
-				count("short write");
 			return 1;
 		}
 
@@ -163,8 +72,6 @@ readrequest(int fd)
 		// 1. Partial GET request
 		// 2. GET request with body
 	}
-
-	count("dropped request");
 
 	return 0;
 }
@@ -180,10 +87,8 @@ acceptnew(int svfd)
 		switch (errno)
 		{
 			case EAGAIN:
-				count("EAGAIN");
 				break; // preempted by other thread
 			case ECONNABORTED:
-				count("ECONNABORTED");
 				break; // peer went away
 			case EMFILE:
 			case ENFILE:
@@ -298,9 +203,6 @@ serve(int numthreads, int svfd)
 	}
 
 	io(svfd);
-
-	printf("\n");
-	printcounters();
 }
 
 int
