@@ -29,9 +29,9 @@ int edge;
 
 char response[] =
 	"HTTP/1.1 200 OK\r\n"
-	"Content-Length: 2\r\n"
+	"Content-Length: 12\r\n"
 	"\r\n"
-	"OK";
+	"Hello world\n";
 
 void
 handlecbrk(int nr)
