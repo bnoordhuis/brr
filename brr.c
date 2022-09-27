@@ -4,13 +4,12 @@
 #include <linux/io_uring.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h> // TODO remove
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -20,12 +19,6 @@
 #define arraylen(a) (sizeof(a) / sizeof(*a))
 #define arrayend(a) (a + arraylen(a))
 #define prob(p, t) __builtin_expect_with_probability(!!(t), 1, p)
-
-enum
-{
-	READABLE	= 1<<0,
-	WRITING		= 1<<1,
-};
 
 typedef uint8_t u8;
 typedef uint32_t u32;
@@ -40,11 +33,8 @@ u32 *sqhead, *sqtail, *sqmask, *sqarray;
 u32 *cqhead, *cqtail, *cqmask;
 u32 nsubmit;
 
-int evtfd;
 int ringfd;
 int listenfd;
-
-u8 fdstate[8192];
 
 char response[] =
 	"HTTP/1.1 200 OK\r\n"
@@ -52,7 +42,9 @@ char response[] =
 	"\r\n"
 	"Hello world\n";
 char *responsepage;
-u32 response_buf_index;
+u8 *buffers;
+
+int files[256];
 
 int
 io_uring_setup(u32 entries, struct io_uring_params *params)
@@ -72,104 +64,114 @@ io_uring_enter(int ringfd, unsigned nsubmit, unsigned mincomplete, unsigned flag
 	return syscall(__NR_io_uring_enter, ringfd, nsubmit, mincomplete, flags, arg, arglen);
 }
 
-int
-push(struct io_uring_sqe *e)
+void
+flush(void)
 {
-	u32 head, tail, slot;
+	int n;
 
-	head = atomic_load_explicit((atomic_uint *) sqhead, memory_order_acquire);
-	tail = *sqtail;
+	if (nsubmit == 0)
+		return;
 
-	if (head+1 == tail)
-		return 0;
+	n = io_uring_enter(ringfd, nsubmit, 0, IORING_ENTER_SQ_WAKEUP, 0, 0);
 
-	slot = tail & *sqmask;
-	sqe[slot] = *e;
-	sqarray[slot] = slot;
+	if (n == -1)
+		err(1, "io_uring_enter IORING_ENTER_SQ_WAKEUP");
 
-	atomic_store_explicit((atomic_uint *) sqtail, tail+1, memory_order_release);
-
-	return 1;
-}
-
-int
-pop(struct io_uring_cqe *e)
-{
-	u32 head;
-
-	head = atomic_load_explicit((atomic_uint *) cqhead, memory_order_acquire);
-	if (head == *cqtail)
-		return 0;
-
-	*e = cqe[head & *cqmask];
-	atomic_store_explicit((atomic_uint *) cqhead, head+1, memory_order_release);
-
-	return 1;
+	nsubmit -= n;
 }
 
 void
-send_response(int fd, void *buf, u32 len)
+startaccept(int listenfd)
 {
-	struct io_uring_sqe e;
-	int n;
+	u32 head, slot;
 
-	e = (struct io_uring_sqe)
+	for (;;)
+	{
+		head = atomic_load_explicit((atomic_uint *) sqhead, memory_order_acquire);
+
+		if (head+1 != *sqtail)
+			break;
+
+		flush();
+	}
+
+	slot = *sqtail & *sqmask;
+
+	sqarray[slot] = slot;
+
+	sqe[slot] = (struct io_uring_sqe)
+	{
+		.opcode		= IORING_OP_ACCEPT,
+		.flags		= IOSQE_ASYNC,
+		.fd		= listenfd,
+		.user_data	= ~0ull,
+		.accept_flags	= SOCK_CLOEXEC|SOCK_NONBLOCK,
+	};
+
+	atomic_store_explicit((atomic_uint *) sqtail, *sqtail+1, memory_order_release);
+	nsubmit += 1;
+}
+
+void
+writeread(int fd, void *buf, u32 len)
+{
+	u32 slot0, slot1;
+
+	slot0 = (*sqtail+0) & *sqmask;
+	slot1 = (*sqtail+1) & *sqmask;
+
+	sqarray[slot0] = slot0;
+	sqarray[slot1] = slot1;
+
+	sqe[slot0] = (struct io_uring_sqe)
 	{
 		.opcode		= IORING_OP_WRITE_FIXED,
 		.fd		= fd,
 		.len		= len,
 		.addr		= (u64) buf,
-		.user_data	= fd,
-		.buf_index	= response_buf_index,
+		.flags		= IOSQE_IO_LINK,
+		.user_data	= 1337,
+		.buf_index	= 0,
 	};
 
-	while (!push(&e))
+	sqe[slot1] = (struct io_uring_sqe)
 	{
-		n = io_uring_enter(ringfd, nsubmit, 0, IORING_ENTER_SQ_WAIT, 0, 0);
-		if (n == -1)
-			err(1, "io_uring_enter IORING_ENTER_SQ_WAIT");
-		nsubmit -= n;
-	}
+		.opcode		= IORING_OP_READ_FIXED,
+		.fd		= fd,
+		.len		= 4096,
+		.addr		= (u64) &buffers[4096],
+		.user_data	= fd,
+		.buf_index	= 0,
+	};
 
-	nsubmit++;
+	atomic_store_explicit((atomic_uint *) sqtail, *sqtail+2, memory_order_release);
+
+	nsubmit += 2;
 }
 
 int
-readrequest(int fd)
+readrequest(int fd, void *buf, size_t len)
 {
-	_Alignas(64) u8 b[4096]; // on cache line
-	long n;
 	u64 v;
-
-	do
-		n = read(fd, b, sizeof(b));
-	while (n == -1 && errno == EINTR);
-
-	if (n == -1)
-		return errno == EAGAIN; // TODO clear READABLE flag or not?
 
 	// Errors or EOF cannot really happen at this point. Because of
 	// TCP_DEFER_ACCEPT there must be some bytes to read, unless the
 	// peer already went away. A peer that sends fewer bytes than is
 	// reasonable is treated with prejudice.
-	if (prob(.001, n <= (long) sizeof("GET / HTTP/1.0\r\n")-1))
+	if (prob(.001, len <= sizeof("GET / HTTP/1.0\r\n")-1))
 		return 0;
 
-	if (prob(.001, n == (long) sizeof(b)))
-		fdstate[fd] &= ~READABLE;
-
-	__builtin_memcpy(&v, b, 8);
+	__builtin_memcpy(&v, buf, 8);
 
 	if (prob(.95, v == 0x5448202F20544547ull)) // "GET / HT"
 	{
 		v = 0;
-		__builtin_memcpy(&v, b+n-4, 4);
+		__builtin_memcpy(&v, buf+len-4, 4);
 
 		if (prob(.99, v == 0x0A0D0A0D)) // "\r\n\r\n"
 		{
 			// Common case: GET request with complete headers.
-			send_response(fd, responsepage, sizeof(response)-1);
-			fdstate[fd] |= WRITING;
+			writeread(fd, responsepage, sizeof(response)-1);
 			return 1;
 		}
 
@@ -181,152 +183,70 @@ readrequest(int fd)
 	return 0;
 }
 
-int
-acceptnew(int listenfd)
-{
-	int fd;
-
-	fd = accept4(listenfd, 0, 0, SOCK_CLOEXEC|SOCK_NONBLOCK);
-	if (prob(.01, fd == -1))
-	{
-		switch (errno)
-		{
-			case EAGAIN:
-				break; // preempted by other thread
-			case ECONNABORTED:
-				break; // peer went away
-			case EMFILE:
-			case ENFILE:
-				err(1, "accept"); // TODO handle
-			case ENOBUFS:
-			case ENOMEM:
-				err(1, "accept"); // TODO handle
-			default:
-				err(1, "accept"); // fatal
-		}
-		return -1;
-	}
-
-	if (prob(.0001, fd >= (int) arraylen(fdstate)))
-		errx(1, "too many file descriptors");
-
-	fdstate[fd] = READABLE;
-
-	if (readrequest(fd))
-		return fd;
-
-	close(fd);
-	return -1;
-}
-
 void
 io(void)
 {
-	struct epoll_event events[64];
-	struct epoll_event e;
-	int timeout;
-	int i, n;
-	int epfd;
+	struct io_uring_cqe e;
+	u32 head;
 	int fd;
+	int n;
 
-	epfd = epoll_create1(EPOLL_CLOEXEC);
-	if (epfd == -1)
-		err(1, "epoll_create1");
-
-	e = (struct epoll_event)
-	{
-		.events = EPOLLIN,
-		.data.fd = evtfd,
-	};
-
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, evtfd, &e))
-		err(1, "epoll_ctl EPOLL_CTL_ADD");
-
-	e = (struct epoll_event)
-	{
-		.events = EPOLLIN,
-		.data.fd = listenfd,
-	};
-
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &e))
-		err(1, "epoll_ctl EPOLL_CTL_ADD");
+	startaccept(listenfd);
 
 	for (;;)
 	{
-		if (nsubmit > 0)
+		// TODO only set IORING_ENTER_SQ_WAKEUP when nsubmit > 0?
+		do
+			n = io_uring_enter(ringfd, nsubmit, 1, IORING_ENTER_GETEVENTS|IORING_ENTER_SQ_WAKEUP, 0, 0);
+		while (n == -1 && errno == EINTR);
+
+		if (n == -1)
+			err(1, "io_uring_enter IORING_ENTER_GETEVENTS");
+
+		nsubmit -= n;
+
+		for (;;)
 		{
-			n = io_uring_enter(ringfd, nsubmit, 0, IORING_ENTER_SQ_WAKEUP, 0, 0);
-			if (n == -1)
-				err(1, "io_uring_enter IORING_ENTER_SQ_WAKEUP");
-			nsubmit -= n;
-		}
+			head = atomic_load_explicit((atomic_uint *) cqhead, memory_order_acquire);
 
-		timeout = -1;
+			if (head == *cqtail)
+				break;
 
-		n = epoll_wait(epfd, events, arraylen(events), timeout);
+			e = cqe[head & *cqmask];
 
-		for (i = 0; i < n; i++)
-		{
-			fd = events[i].data.fd;
+			atomic_store_explicit((atomic_uint *) cqhead, head+1, memory_order_release);
 
-			if (prob(.1, fd == listenfd))
-			{
-				fd = acceptnew(listenfd);
-				if (fd != -1)
-				{
-					e = (struct epoll_event)
-					{
-						.events = EPOLLIN|EPOLLET,
-						.data.fd = fd,
-					};
-					if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &e))
-						err(1, "epoll_ctl EPOLL_CTL_ADD");
-				}
+			if (e.res < 0)
 				continue;
-			}
 
-			if (prob(.1, fd == evtfd))
+			if (e.user_data == 1337)
+				continue;
+
+			if (e.user_data == ~0ull)
 			{
-				struct io_uring_cqe e;
-				u64 data;
-				int fd;
-				int n;
+				startaccept(listenfd);
 
+				fd = e.res;
 				do
-					n = (int) read(evtfd, &data, sizeof(data));
+					n = read(fd, &buffers[4096], 4096);
 				while (n == -1 && errno == EINTR);
-
-				while (pop(&e))
-				{
-					fd = e.user_data;
-					fdstate[fd] &= ~WRITING;
-					if (fdstate[fd] & READABLE)
-						if (!readrequest(fd))
-							close(fd);
-				}
-
-				continue;
 			}
-
-			if (fdstate[fd] & WRITING)
+			else
 			{
-				fdstate[fd] |= READABLE;
+				fd = (int) e.user_data;
+				n = e.res;
+			}
+
+			if (n <= 0)
+			{
+				close(fd);
 				continue;
 			}
 
-			if (!readrequest(fd))
+			if (!readrequest(fd, &buffers[4096], n))
 				close(fd);
 		}
 	}
-
-}
-
-int
-startio(void *unused)
-{
-	(void) &unused;
-	io();
-	return 0;
 }
 
 int
@@ -336,15 +256,14 @@ main(void)
 	int on;
 	int i;
 
+	for (i = 0; i < (int) arraylen(files); i++)
+		files[i] = -1;
+
 	params = (struct io_uring_params)
 	{
 		.flags		= IORING_SETUP_SQPOLL,	// needs CAP_SYS_NICE?
 		.sq_thread_idle	= 1,			// milliseconds
 	};
-
-	evtfd = eventfd(0, EFD_CLOEXEC|EFD_NONBLOCK);
-	if (evtfd == -1)
-		err(1, "eventfd");
 
 	ringfd = io_uring_setup(32, &params);
 	if (ringfd == -1)
@@ -385,30 +304,30 @@ main(void)
 	cqmask = (u32 *) (cq + params.cq_off.ring_mask);
 	cqe = (struct io_uring_cqe *) (cq + params.cq_off.cqes);
 
-	if (io_uring_register(ringfd, IORING_REGISTER_EVENTFD, &evtfd, 1))
-		err(1, "io_uring_register IORING_REGISTER_EVENTFD");
-
-	responsepage = mmap(
-		0, sizeof(response)-1,
+	buffers = mmap(
+		0, 32768,
 		PROT_READ|PROT_WRITE,
 		MAP_ANONYMOUS|MAP_PRIVATE,
 		-1, 0
 	);
-	if (responsepage == MAP_FAILED)
+	if (buffers == MAP_FAILED)
 		err(1, "mmap");
 
-	memcpy(responsepage, response, sizeof(response)-1);
+	responsepage = memcpy(buffers, response, sizeof(response)-1);
 
 	struct iovec buf = (struct iovec)
 	{
-		.iov_base	= responsepage,
-		.iov_len	= sizeof(response)-1,
+		.iov_base	= buffers,
+		.iov_len	= 32768,
 	};
 
 	if (io_uring_register(ringfd, IORING_REGISTER_BUFFERS, &buf, 1))
 		err(1, "io_uring_register IORING_REGISTER_BUFFERS");
 
-	listenfd = socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+	if (io_uring_register(ringfd, IORING_REGISTER_FILES, files, arraylen(files)))
+		err(1, "io_uring_register IORING_REGISTER_FILES");
+
+	listenfd = socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, 0);
 	if (listenfd == -1)
 		err(1, "socket");
 
